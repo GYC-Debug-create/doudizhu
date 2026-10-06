@@ -96,7 +96,7 @@ import { createPresentation } from '../../ui/presenter.js'
 import { createDoudizhuController, createGuandanController } from '../../ui/game-controllers.js'
 import { createTurnScheduler } from '../../ui/turn-scheduler.js'
 import { createFeedback } from '../../ui/feedback.js'
-import { sfx, say, audioIdle, setSoundEnabled, unlockAudio } from '../../ui/sound.js'
+import { sfx, speak, audioIdle, setSoundEnabled, unlockAudio } from '../../ui/sound.js'
 import { computeStage } from '../../ui/viewport.js'
 import { totalMul } from '../../ui/doudizhu-view.js'
 import { DOUDIZHU_SEATS, GUANDAN_SEATS, MODE_OPTIONS, modeLabel } from '../../ui/table-config.js'
@@ -184,7 +184,7 @@ export default {
     // 控制器持有引擎实例，刻意不放进 data：引擎保持在响应式图之外，snapshot 是唯一数据通道
     this.dz = createDoudizhuController({ seats: DOUDIZHU_SEATS, emit: bus.emit })
     this.gd = createGuandanController({ seats: GUANDAN_SEATS, emit: bus.emit })
-    this.feedback = createFeedback({ sfx, say, waitAudio: audioIdle, showFx: this.showFx })
+    this.feedback = createFeedback({ sfx, speak, waitAudio: audioIdle, showFx: this.showFx })
     this.scheduler = createTurnScheduler({
       currentSeat: () => this.ctrl().currentAISeat(),
       step: (seat) => this.ctrl().aiStep(seat),
@@ -221,9 +221,10 @@ export default {
         if (game === 'guandan') this.guandanSnap = snap
         else this.snap = snap
       })
-      bus.on('play', active(({ game, action, seq }) => {
-        this.pres.playAction(action.seat)
-        this.feedback.play({ game, action, seq, totalMul: this.totalMul })
+      bus.on('play', active((e) => {
+        // 掼蛋的过牌不播出牌动画
+        if (!(e.game === 'guandan' && e.action.pass)) this.pres.playAction(e.action.seat)
+        this.feedback.play({ ...e, totalMul: this.totalMul })
       }))
       bus.on('bid', active(({ seat, kind }) => {
         this.pres.bidAction(seat)
@@ -307,7 +308,7 @@ export default {
       this.beanDelta = result.delta
       this.roundSettled = true
       this.stats = recordResult(this.stats, delta)
-      this.feedback.settle({ won: delta > 0, spring: game === 'doudizhu' ? snap.spring : null })
+      this.feedback.settle({ settle, spring: game === 'doudizhu' ? snap.spring : null })
       this.saveProfile()
     },
 

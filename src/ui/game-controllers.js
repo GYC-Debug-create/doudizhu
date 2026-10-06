@@ -14,7 +14,8 @@
  *
  * 事件（payload 均带 game: 'doudizhu' | 'guandan'）：
  *   snap { snap }               每次刷新后的最新快照
- *   play { action, seq }        新出牌（斗地主含过牌，掼蛋只报实出）
+ *   play { action, seq, lead, mate }  新出牌或过牌；lead = 是否领出新一轮，
+ *                               mate = 台面上的牌是否是队友出的（过牌时用来区分“让队友”与“要不起”）
  *   bid { seat, kind }          新叫/抢表态（kind: bid-call 等，仅斗地主）
  *   trick                       台面出牌/过牌更新
  *   bottom { cards }            底牌确定（仅斗地主）
@@ -26,12 +27,19 @@
  *   error { error }
  */
 import { DoudizhuGame, PHASE } from '../game/rules.js'
-import { GuandanGame, GD_PHASE } from '../game/guandan/rules.js'
+import { GuandanGame, GD_PHASE, GD_TEAMS } from '../game/guandan/rules.js'
 import { aiBid, aiRob, aiPlay, hintCandidates } from '../game/ai.js'
 import { aiGuandanPlay, aiGuandanHint } from '../game/guandan/ai.js'
 
 const BID_ACTION_TYPES = new Set(['bid-call', 'bid-pass', 'rob-call', 'rob-pass'])
 const isPlayType = (type) => type === 'play' || type === 'pass'
+
+/** 本次出牌/过牌之前，台面归谁：领出与队友判断都基于它 */
+function playContext(prev, action, sameTeam) {
+  const owner = prev.current ? prev.current.seat : null
+  const lead = owner === null || owner === action.seat
+  return { lead, mate: !lead && sameTeam(owner, action.seat) }
+}
 
 /** 两个控制器共用的骨架：快照 diff + 动作执行 + 事件发射 */
 function createBase(game, emit, diff) {
@@ -73,7 +81,11 @@ export function createDoudizhuController({ seats, emit }) {
       if (latest && isPlayType(latest.type)) send('trick')
       if (latest && BID_ACTION_TYPES.has(latest.type)) send('bid', { seat: latest.seat, kind: latest.type })
     }
-    if (snap.history.length > prev.history.length) send('play', { action: snap.history[snap.history.length - 1], seq: snap.seq })
+    if (snap.history.length > prev.history.length) {
+      const action = snap.history[snap.history.length - 1]
+      const farmers = (a, b) => snap.landlordSeat !== null && a !== snap.landlordSeat && b !== snap.landlordSeat
+      send('play', { action, seq: snap.seq, ...playContext(prev, action, farmers) })
+    }
     if (!prev.bottom && snap.bottom) send('bottom', { cards: snap.bottom })
     if (snap.phase === PHASE.OVER && prev.phase !== PHASE.OVER) {
       if (snap.overReason === 'no-bid') send('no-bid')
@@ -182,8 +194,8 @@ export function createGuandanController({ seats, emit }) {
       if (latest && isPlayType(latest.type)) send('trick')
     }
     if (snap.history.length > prev.history.length) {
-      const latest = snap.history[snap.history.length - 1]
-      if (!latest.pass) send('play', { action: latest, seq: snap.seq })
+      const action = snap.history[snap.history.length - 1]
+      send('play', { action, seq: snap.seq, ...playContext(prev, action, (a, b) => GD_TEAMS[a] === GD_TEAMS[b]) })
     }
     if (snap.phase === GD_PHASE.OVER && prev.phase !== GD_PHASE.OVER) {
       if (snap.roundResult) {

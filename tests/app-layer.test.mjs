@@ -2,7 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createBus } from '../src/ui/event-bus.js'
 import { createTurnScheduler } from '../src/ui/turn-scheduler.js'
-import { playCue, bidCue, createFeedback } from '../src/ui/feedback.js'
+import { playCue, bidCue, settleCue, createFeedback } from '../src/ui/feedback.js'
+import { LINES, MOODS, allClips, pickLine } from '../src/ui/voice-lines.js'
+import { existsSync } from 'node:fs'
 import { normalizeProfile, recordResult, applyRelief, settleBeans, emptyStats, RELIEF_AMOUNT } from '../src/ui/profile.js'
 import { computeStage } from '../src/ui/viewport.js'
 import { keyIntent } from '../src/ui/keyboard.js'
@@ -83,50 +85,98 @@ test('节奏调度：被阻塞（底牌翻开中）或无 AI 座位时不调度'
 
 // ---------- feedback ----------
 
-test('反馈映射：炸弹/王炸带特效与倍数，普通牌只有播报，过牌轮换说法', () => {
-  const bomb = playCue('doudizhu', { seat: 1, pattern: analyze(cardsFromIds([0, 1, 2, 3])) })
-  assert.equal(bomb.sfx, 'bomb')
-  assert.equal(bomb.fx.kind, 'bomb')
-  assert.equal(bomb.fx.showMul, true)
-  assert.equal(bomb.say, '炸弹')
+test('反馈映射：牌型对应台词，炸弹/王炸带特效与倍数，过牌区分“让队友”', () => {
+  const never = () => 0.99 // 不触发随机嘲讽
+  const bomb = playCue('doudizhu', { seat: 1, pattern: analyze(cardsFromIds([0, 1, 2, 3])) }, { random: never })
+  assert.deepEqual([bomb.sfx, bomb.line, bomb.fx.kind, bomb.fx.showMul], ['bomb', 'bomb', 'bomb', true])
 
-  const pair = playCue('doudizhu', { seat: 1, pattern: analyze(cardsFromIds([40, 41])) })
-  assert.deepEqual([pair.sfx, pair.say, pair.fx], ['play', '对K', null])
+  const pair = playCue('doudizhu', { seat: 1, pattern: analyze(cardsFromIds([40, 41])) }, { random: never })
+  assert.deepEqual([pair.sfx, pair.line, pair.fx], ['play', 'pair-13', null])
 
-  const words = new Set([0, 1, 2].map((seq) => playCue('doudizhu', { seat: 0, pass: true }, seq).say))
-  assert.equal(words.size, 3)
+  assert.equal(playCue('doudizhu', { seat: 2, pass: true }, { mate: false }).line, 'pass')
+  assert.equal(playCue('doudizhu', { seat: 2, pass: true }, { mate: true }).line, 'pass-mate')
+  assert.equal(playCue('guandan', { seat: 1, pattern: { type: 'ROCKET', rank: 17 } }).fx.text, '四王')
+  assert.equal(bidCue('rob-call').line, 'rob-call')
+})
 
-  assert.equal(playCue('guandan', { seat: 1, pattern: { type: 'ROCKET' } }).fx.text, '四王')
-  assert.equal(bidCue('rob-call').say, '抢地主')
+test('反馈映射：跟牌压对手时偶尔嘲讽，领出和压队友时不会', () => {
+  const always = () => 0
+  const single = { seat: 1, pattern: analyze(cardsFromIds([44])) }
+  assert.equal(playCue('doudizhu', single, { lead: false, mate: false, random: always }).line, 'beat')
+  assert.equal(playCue('doudizhu', single, { lead: true, random: always }).line, 'solo-14')
+  const rocket = { seat: 1, pattern: analyze(cardsFromIds([52, 53])) }
+  assert.equal(playCue('doudizhu', rocket, { lead: false, random: always }).line, 'rocket', '王炸永远喊王炸')
+})
+
+test('台词表：反馈会用到的台词都有，且每条台词都已生成音频文件', () => {
+  const keys = new Set(['pass', 'pass-mate', 'beat', 'bid-call', 'bid-pass', 'rob-call', 'rob-pass', 'alarm-1', 'alarm-2',
+    'win', 'lose', 'hurry', 'spring', 'anti-spring', 'triple-solo', 'triple-pair', 'straight', 'straight-pair', 'plane',
+    'bomb', 'rocket', 'gd-triple-pair', 'gd-straight-pair', 'gd-steel', 'gd-straight-flush', 'gd-rocket'])
+  for (let r = 3; r <= 17; r++) keys.add(`solo-${r}`)
+  for (let r = 3; r <= 15; r++) keys.add(`pair-${r}`).add(`triple-${r}`)
+  for (const key of keys) assert.ok(LINES[key] && LINES[key].length, `缺台词 ${key}`)
+  for (const v of Object.values(LINES).flat()) assert.ok(MOODS[v.mood], `未知情绪 ${v.mood}`)
+  const missing = allClips().filter((c) => !existsSync(new URL(`../src/static/${c.path}`, import.meta.url)))
+  assert.deepEqual(missing.map((c) => c.path), [], '有台词没生成音频：运行 npm run voice')
+  assert.equal(pickLine('pass', () => 0.999).index, LINES.pass.length - 1)
 })
 
 test('反馈：报单/报双每家每档只提醒一次，且排队在出牌播报之后', () => {
   const calls = []
   const fb = createFeedback({
     sfx: (n) => calls.push(['sfx', n]),
-    say: (text, seat, opts) => calls.push(['say', text, seat, !!(opts && opts.queue)]),
+    speak: (seat, key, opts) => calls.push(['speak', seat, key, !!(opts && opts.queue)]),
     waitAudio: () => Promise.resolve(),
     showFx: () => {},
   })
   const snap = { phase: 'play', players: [{ seat: 0, cardCount: 1 }, { seat: 1, cardCount: 2 }, { seat: 2, cardCount: 5 }] }
   fb.alarms(snap)
   fb.alarms(snap)
-  assert.deepEqual(calls, [['sfx', 'alarm'], ['say', '我只剩两张牌啦', 1, true]], '自己不报、重复不报')
+  assert.deepEqual(calls, [['sfx', 'alarm'], ['speak', 1, 'alarm-2', true]], '自己不报、重复不报')
   fb.reset()
   fb.alarms(snap)
   assert.equal(calls.length, 4, '新一局重新提醒')
 })
 
-test('反馈：结算音在新开一局后作废', async () => {
+test('反馈：结算由输赢另一方的 AI 发声，新开一局后作废', async () => {
   const calls = []
-  const fb = createFeedback({ sfx: (n) => calls.push(n), say: () => {}, waitAudio: () => Promise.resolve(), showFx: () => {} })
-  fb.settle({ won: true })
+  const fb = createFeedback({ sfx: (n) => calls.push(n), speak: (seat, key) => calls.push(`${seat}:${key}`), waitAudio: () => Promise.resolve(), showFx: () => {} })
+  const iWin = [{ seat: 0, delta: 200 }, { seat: 1, delta: -100 }, { seat: 2, delta: -100 }]
+  fb.settle({ settle: iWin })
   fb.reset()
   await sleep(260)
   assert.deepEqual(calls, [])
-  fb.settle({ won: false })
+  fb.settle({ settle: iWin })
   await sleep(260)
-  assert.deepEqual(calls, ['lose'])
+  assert.deepEqual(calls, ['win', '1:lose'], '你赢了：输家 AI 叹气')
+
+  const iLose = [{ seat: 0, delta: -200 }, { seat: 1, delta: 100 }, { seat: 2, delta: 100 }]
+  assert.deepEqual(settleCue({ settle: iLose }), { sfx: 'lose', seat: 1, line: 'win', won: false })
+  assert.equal(settleCue({ settle: iWin, spring: 'spring' }).line, 'spring')
+})
+
+test('反馈：轮到你拖太久，AI 会催；轮次一变就取消', () => {
+  const calls = []
+  const timers = []
+  const fb = createFeedback({
+    sfx: () => {},
+    speak: (seat, key) => calls.push(`${seat}:${key}`),
+    waitAudio: () => new Promise(() => {}),
+    showFx: () => {},
+    random: () => 0,
+    setTimer: (fn, ms) => timers.push({ fn, ms, live: true }) - 1,
+    clearTimer: (id) => {
+      timers[id].live = false
+    },
+  })
+  const players = [{ seat: 0 }, { seat: 1 }, { seat: 2 }]
+  fb.turn({ phase: 'play', turnSeat: 0, seq: 5, players })
+  assert.equal(timers.length, 1)
+  fb.turn({ phase: 'play', turnSeat: 1, seq: 6, players })
+  assert.equal(timers[0].live, false, '轮次变化后取消催促')
+  fb.turn({ phase: 'play', turnSeat: 0, seq: 7, players })
+  timers[1].fn()
+  assert.deepEqual(calls, ['1:hurry'])
 })
 
 // ---------- profile ----------

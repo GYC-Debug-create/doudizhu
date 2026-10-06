@@ -1,12 +1,12 @@
 /**
- * 音效与语音播报 —— 全部用 WebAudio 现场合成（无需音频资源），语音走浏览器 speechSynthesis。
+ * 音效与语音 —— 音效用 WebAudio 现场合成；语音播放预录的神经网络语音包（static/voice，见 voice-lines.js），
+ * 语音包缺失或加载失败时退回浏览器 speechSynthesis。
  * 非 H5 环境（小程序 / Node 单测）下所有方法静默降级为空操作。
  *
  * 节奏同步：每次播放都会登记“声音忙到什么时候”，audioIdle() 在语音与音效都播完后才 resolve，
  * 页面据此推迟下一家行动，保证“谁的动作配谁的声音”，不会互相打断或叠在一起。
  */
-import { RANK_CHARS } from '../game/cards.js'
-import { T } from '../game/patterns.js'
+import { pickLine, clipPath, voiceOf } from './voice-lines.js'
 
 let ctx = null
 let enabled = true
@@ -267,49 +267,122 @@ export function say(text, seat = 0, { queue = false } = {}) {
   } catch (e) {}
 }
 
-function rankWord(rank) {
-  return RANK_CHARS[rank] || ''
+// ---------- 预录语音包 ----------
+
+let currentClip = null // 正在播放的 job：{ url, text, seat, source, done }
+let clipQueue = [] // 排队等待播放的 job
+
+function finishClip(job) {
+  if (job.done) return
+  job.done = true
+  clearTimeout(job.guard)
+  speechPending = Math.max(0, speechPending - 1)
+  if (currentClip === job) {
+    currentClip = null
+    const next = clipQueue.shift()
+    if (next) startClip(next)
+  }
+  flushIdle()
 }
 
-/** 出牌 → 播报文案（欢乐斗地主风格） */
-export function patternCallout(pattern) {
-  if (!pattern) return ''
-  switch (pattern.type) {
-    case T.SOLO:
-      return rankWord(pattern.rank)
-    case T.PAIR:
-      return `对${rankWord(pattern.rank)}`
-    case T.TRIPLE:
-      return `三个${rankWord(pattern.rank)}`
-    case T.TRIPLE_SOLO:
-      return '三带一'
-    case T.TRIPLE_PAIR:
-      return '三带一对'
-    case T.STRAIGHT:
-      return '顺子'
-    case T.STRAIGHT_PAIR:
-      return '连对'
-    case T.PLANE:
-    case T.PLANE_SOLO:
-    case T.PLANE_PAIR:
-      return '飞机'
-    case T.BOMB:
-      return '炸弹'
-    case T.ROCKET:
-      return '王炸'
-    default:
-      return ''
+// 语音包里每段 mp3 首尾都带有长静音（最短的也有近 2 秒）：解码后只播真正有声音的那一段
+const clipCache = new Map() // url -> Promise<{ buffer, start, end }>
+const SILENCE = 0.015
+
+function audibleRange(buffer) {
+  const data = buffer.getChannelData(0)
+  let first = 0
+  let last = data.length - 1
+  while (first < last && Math.abs(data[first]) < SILENCE) first++
+  while (last > first && Math.abs(data[last]) < SILENCE) last--
+  const rate = buffer.sampleRate
+  const start = Math.max(0, first / rate - 0.02)
+  const end = Math.min(buffer.duration, last / rate + 0.1)
+  return end > start ? { start, end } : { start: 0, end: buffer.duration }
+}
+
+function loadClip(url) {
+  if (!clipCache.has(url)) {
+    const ac = audio()
+    const loading = fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.arrayBuffer()
+      })
+      .then((bytes) => new Promise((resolve, reject) => ac.decodeAudioData(bytes, resolve, reject)))
+      .then((buffer) => ({ buffer, ...audibleRange(buffer) }))
+    loading.catch(() => clipCache.delete(url))
+    clipCache.set(url, loading)
+  }
+  return clipCache.get(url)
+}
+
+function startClip(job) {
+  currentClip = job
+  // 兜底：极少数情况下既不触发 ended 也不报错
+  job.guard = setTimeout(() => finishClip(job), 6000)
+  const ac = audio()
+  if (!ac || typeof fetch === 'undefined') {
+    finishClip(job)
+    say(job.text, job.seat)
+    return
+  }
+  loadClip(job.url)
+    .then((clip) => {
+      if (job.done) return
+      const source = ac.createBufferSource()
+      source.buffer = clip.buffer
+      source.connect(ac.destination)
+      source.onended = () => finishClip(job)
+      job.source = source
+      source.start(0, clip.start, clip.end - clip.start)
+    })
+    .catch(() => {
+      finishClip(job)
+      say(job.text, job.seat) // 语音包缺这条：退回浏览器语音
+    })
+}
+
+function stopClips() {
+  const queued = clipQueue
+  clipQueue = []
+  queued.forEach(finishClip)
+  if (currentClip) {
+    const job = currentClip
+    try {
+      job.source && job.source.stop()
+    } catch (e) {}
+    finishClip(job)
   }
 }
 
-const PASS_WORDS = ['不要', '要不起', '过']
-export function passCallout(seq = 0) {
-  return PASS_WORDS[Math.abs(seq) % PASS_WORDS.length]
+/**
+ * 某座位说一句台词（key 见 voice-lines.js，变体随机）。
+ * 默认打断正在说的话（新动作优先）；queue=true 时排在后面（如出牌后紧跟的“报单”）。
+ */
+export function speak(seat, key, { queue = false, random = Math.random } = {}) {
+  if (!enabled) return
+  const picked = pickLine(key, random)
+  if (!picked) return
+  const job = { url: `/static/${clipPath(voiceOf(seat).id, picked.key, picked.index)}`, text: picked.text, seat, done: false }
+  speechPending += 1
+  if (queue && currentClip) {
+    clipQueue.push(job)
+    return
+  }
+  stopClips()
+  if (typeof speechSynthesis !== 'undefined') {
+    try {
+      speechSynthesis.cancel()
+    } catch (e) {}
+  }
+  startClip(job)
 }
 
 export function setSoundEnabled(on) {
   enabled = !!on
   if (!enabled) {
+    stopClips()
     if (typeof speechSynthesis !== 'undefined') {
       try {
         speechSynthesis.cancel()
