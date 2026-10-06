@@ -1,0 +1,18 @@
+/* 电脑端缩放舞台：zoom 由页面按窗口尺寸计算 */
+.stage {
+  display: flex; flex-direction: column;
+  flex: 1; min-height: 0; width: 100%;
+}
+.stage .topbar,
+.stage .mode-line,
+.stage .playfield,
+.stage .guandan-board,
+.stage .player-zone { max-width: var(--stage-w, 1180px); }
+/* 面板根节点撑满舞台剩余高度，让牌桌区域随屏幕伸展 */
+.stage.zoomed .dz-root { display: flex; flex-direction: column; flex: 1; min-height: 0; width: 100%; }
+/* 电脑放大模式：手牌居中、展开（宽度足够，不再需要横向滑动） */
+.stage.zoomed .hand { justify-content: center; }
+.stage.zoomed .hand-card { margin-left: -4px; }
+.stage.zoomed .hand-card:first-child { margin-left: 0; }
+.stage.zoomed .scroll-hint-row,
+.stage.zoomed .hand-fade { display: none; }
